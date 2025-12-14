@@ -13,3 +13,5 @@ edition = "2024"
 [workspace.dependencies]
 slatedb = "0.9.1"
 opendata-common = { path = "./opendata-common" }
+rstest = "0.19"
+bytes = "1.0"

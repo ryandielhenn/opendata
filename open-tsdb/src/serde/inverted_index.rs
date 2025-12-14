@@ -1,6 +1,7 @@
 // InvertedIndex value structure using RoaringBitmap
 
 use super::common::*;
+use bytes::Bytes;
 use roaring::RoaringBitmap;
 
 /// InvertedIndex value: RoaringBitmap<u32> encoding series IDs
@@ -10,14 +11,14 @@ pub struct InvertedIndexValue {
 }
 
 impl InvertedIndexValue {
-    pub fn encode(&self) -> Result<Vec<u8>, EncodingError> {
+    pub fn encode(&self) -> Result<Bytes, EncodingError> {
         let mut buf = Vec::new();
         self.series_ids
             .serialize_into(&mut buf)
             .map_err(|e| EncodingError {
                 message: format!("Failed to serialize RoaringBitmap: {}", e),
             })?;
-        Ok(buf)
+        Ok(Bytes::from(buf))
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -43,7 +44,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = InvertedIndexValue::decode(&encoded).unwrap();
+        let decoded = InvertedIndexValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded.series_ids, value.series_ids);
@@ -58,7 +59,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = InvertedIndexValue::decode(&encoded).unwrap();
+        let decoded = InvertedIndexValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded.series_ids, value.series_ids);
@@ -76,7 +77,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = InvertedIndexValue::decode(&encoded).unwrap();
+        let decoded = InvertedIndexValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded.series_ids, value.series_ids);

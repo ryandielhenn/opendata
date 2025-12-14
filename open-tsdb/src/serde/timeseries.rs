@@ -1,6 +1,7 @@
 // TimeSeries value structure with Gorilla compression using tsz crate
 
 use super::common::*;
+use bytes::Bytes;
 use tsz::stream::{BufferedWriter, Error as TszError, Read as TszRead};
 use tsz::{Bit, DataPoint, Decode, Encode, StdDecoder, StdEncoder};
 
@@ -137,10 +138,10 @@ pub struct TimeSeriesValue {
 
 impl TimeSeriesValue {
     /// Encode time series points using Gorilla compression
-    pub fn encode(&self) -> Result<Vec<u8>, EncodingError> {
+    pub fn encode(&self) -> Result<Bytes, EncodingError> {
         // Handle empty case
         if self.points.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Bytes::new());
         }
 
         // Use Gorilla compression
@@ -154,7 +155,7 @@ impl TimeSeriesValue {
         }
 
         let compressed = encoder.close();
-        Ok(compressed.to_vec())
+        Ok(Bytes::from(compressed))
     }
 
     /// Decode time series points from Gorilla-compressed data
@@ -214,7 +215,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = TimeSeriesValue::decode(&encoded).unwrap();
+        let decoded = TimeSeriesValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -227,7 +228,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = TimeSeriesValue::decode(&encoded).unwrap();
+        let decoded = TimeSeriesValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -245,7 +246,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = TimeSeriesValue::decode(&encoded).unwrap();
+        let decoded = TimeSeriesValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -277,7 +278,7 @@ mod tests {
 
         // when
         let encoded = value.encode().unwrap();
-        let decoded = TimeSeriesValue::decode(&encoded).unwrap();
+        let decoded = TimeSeriesValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded.points.len(), 4);

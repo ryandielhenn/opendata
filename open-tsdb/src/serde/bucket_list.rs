@@ -1,6 +1,7 @@
 // BucketList value structure
 
 use super::common::*;
+use bytes::{Bytes, BytesMut};
 
 /// BucketList value: SingleArray<(bucket_size: u8, time_bucket: u32)>
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,10 +10,10 @@ pub struct BucketListValue {
 }
 
 impl BucketListValue {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
         encode_single_array(&self.buckets, &mut buf);
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8], count: usize) -> Result<Self, EncodingError> {
@@ -23,8 +24,8 @@ impl BucketListValue {
 }
 
 impl Encode for (TimeBucketSize, TimeBucket) {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        buf.push(self.0);
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&[self.0]);
         buf.extend_from_slice(&self.1.to_le_bytes());
     }
 }
@@ -57,7 +58,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = BucketListValue::decode(&encoded, 3).unwrap();
+        let decoded = BucketListValue::decode(encoded.as_ref(), 3).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -70,7 +71,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = BucketListValue::decode(&encoded, 0).unwrap();
+        let decoded = BucketListValue::decode(encoded.as_ref(), 0).unwrap();
 
         // then
         assert_eq!(decoded, value);

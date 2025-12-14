@@ -1,5 +1,7 @@
 // Common types, constants, error handling, record tag encoding, and common encoding utilities
 
+use bytes::BytesMut;
+
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
@@ -87,7 +89,7 @@ pub fn decode_record_tag(tag: u8) -> Result<(RecordType, Option<TimeBucketSize>)
 /// Encode a UTF-8 string
 ///
 /// Format: `len: u16` (little-endian) + `len` bytes of UTF-8
-pub fn encode_utf8(s: &str, buf: &mut Vec<u8>) {
+pub fn encode_utf8(s: &str, buf: &mut BytesMut) {
     let bytes = s.as_bytes();
     let len = bytes.len();
     if len > u16::MAX as usize {
@@ -130,7 +132,7 @@ pub fn decode_utf8(buf: &mut &[u8]) -> Result<String, EncodingError> {
 /// Encode an optional non-empty UTF-8 string
 ///
 /// Format: Same as Utf8, but `len = 0` means `None`
-pub fn encode_optional_utf8(opt: Option<&str>, buf: &mut Vec<u8>) {
+pub fn encode_optional_utf8(opt: Option<&str>, buf: &mut BytesMut) {
     match opt {
         Some(s) => encode_utf8(s, buf),
         None => {
@@ -158,7 +160,7 @@ pub fn decode_optional_utf8(buf: &mut &[u8]) -> Result<Option<String>, EncodingE
 
 /// Trait for types that can be encoded to bytes
 pub trait Encode {
-    fn encode(&self, buf: &mut Vec<u8>);
+    fn encode(&self, buf: &mut BytesMut);
 }
 
 /// Trait for types that can be decoded from bytes
@@ -169,7 +171,7 @@ pub trait Decode: Sized {
 /// Encode an array of encodable items
 ///
 /// Format: `count: u16` (little-endian) + `count` serialized elements
-pub fn encode_array<T: Encode>(items: &[T], buf: &mut Vec<u8>) {
+pub fn encode_array<T: Encode>(items: &[T], buf: &mut BytesMut) {
     let count = items.len();
     if count > u16::MAX as usize {
         panic!("Array too long: {} items", count);
@@ -202,7 +204,7 @@ pub fn decode_array<T: Decode>(buf: &mut &[u8]) -> Result<Vec<T>, EncodingError>
 /// Encode a single array (no count prefix)
 ///
 /// Format: Serialized elements back-to-back with no additional padding
-pub fn encode_single_array<T: Encode>(items: &[T], buf: &mut Vec<u8>) {
+pub fn encode_single_array<T: Encode>(items: &[T], buf: &mut BytesMut) {
     for item in items {
         item.encode(buf);
     }
@@ -269,11 +271,11 @@ mod tests {
     fn should_encode_and_decode_utf8() {
         // given
         let s = "Hello, 世界!";
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
 
         // when
         encode_utf8(s, &mut buf);
-        let mut slice = buf.as_slice();
+        let mut slice = buf.as_ref();
         let decoded = decode_utf8(&mut slice).unwrap();
 
         // then
@@ -285,11 +287,11 @@ mod tests {
     fn should_encode_and_decode_optional_utf8_some() {
         // given
         let s = Some("test");
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
 
         // when
         encode_optional_utf8(s, &mut buf);
-        let mut slice = buf.as_slice();
+        let mut slice = buf.as_ref();
         let decoded = decode_optional_utf8(&mut slice).unwrap();
 
         // then
@@ -300,11 +302,11 @@ mod tests {
     fn should_encode_and_decode_optional_utf8_none() {
         // given
         let s: Option<&str> = None;
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
 
         // when
         encode_optional_utf8(s, &mut buf);
-        let mut slice = buf.as_slice();
+        let mut slice = buf.as_ref();
         let decoded = decode_optional_utf8(&mut slice).unwrap();
 
         // then

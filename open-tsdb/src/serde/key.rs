@@ -1,17 +1,18 @@
 // Key structures with big-endian encoding
 
 use super::common::*;
+use bytes::{Bytes, BytesMut};
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketListKey;
 
 impl BucketListKey {
-    pub fn encode(&self) -> Vec<u8> {
-        vec![
+    pub fn encode(&self) -> Bytes {
+        Bytes::from(vec![
             KEY_VERSION,
             encode_record_tag(RecordType::BucketList, None),
-        ]
+        ])
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -56,17 +57,15 @@ pub struct SeriesDictionaryKey {
 }
 
 impl SeriesDictionaryKey {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[
             KEY_VERSION,
-            encode_record_tag(
-                RecordType::SeriesDictionary,
-                Some(self.bucket_size),
-            ),
-        ];
+            encode_record_tag(RecordType::SeriesDictionary, Some(self.bucket_size)),
+        ]);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_fingerprint.to_be_bytes());
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -118,17 +117,15 @@ pub struct ForwardIndexKey {
 }
 
 impl ForwardIndexKey {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[
             KEY_VERSION,
-            encode_record_tag(
-                RecordType::ForwardIndex,
-                Some(self.bucket_size),
-            ),
-        ];
+            encode_record_tag(RecordType::ForwardIndex, Some(self.bucket_size)),
+        ]);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_id.to_be_bytes());
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -179,18 +176,16 @@ pub struct InvertedIndexKey {
 }
 
 impl InvertedIndexKey {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[
             KEY_VERSION,
-            encode_record_tag(
-                RecordType::InvertedIndex,
-                Some(self.bucket_size),
-            ),
-        ];
+            encode_record_tag(RecordType::InvertedIndex, Some(self.bucket_size)),
+        ]);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         encode_utf8(&self.attribute, &mut buf);
         encode_utf8(&self.value, &mut buf);
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -245,17 +240,15 @@ pub struct TimeSeriesKey {
 }
 
 impl TimeSeriesKey {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[
             KEY_VERSION,
-            encode_record_tag(
-                RecordType::TimeSeries,
-                Some(self.bucket_size),
-            ),
-        ];
+            encode_record_tag(RecordType::TimeSeries, Some(self.bucket_size)),
+        ]);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_id.to_be_bytes());
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {

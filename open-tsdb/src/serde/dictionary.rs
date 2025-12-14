@@ -1,6 +1,7 @@
 // SeriesDictionary value structure
 
 use super::common::*;
+use bytes::{Bytes, BytesMut};
 
 /// SeriesDictionary value: SingleArray<series_id: u32>
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,10 +10,10 @@ pub struct SeriesDictionaryValue {
 }
 
 impl SeriesDictionaryValue {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
         encode_single_array(&self.series_ids, &mut buf);
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8], count: u8) -> Result<Self, EncodingError> {
@@ -23,7 +24,7 @@ impl SeriesDictionaryValue {
 }
 
 impl Encode for SeriesId {
-    fn encode(&self, buf: &mut Vec<u8>) {
+    fn encode(&self, buf: &mut BytesMut) {
         buf.extend_from_slice(&self.to_le_bytes());
     }
 }
@@ -54,7 +55,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = SeriesDictionaryValue::decode(&encoded, 5u8).unwrap();
+        let decoded = SeriesDictionaryValue::decode(encoded.as_ref(), 5u8).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -67,7 +68,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = SeriesDictionaryValue::decode(&encoded, 0u8).unwrap();
+        let decoded = SeriesDictionaryValue::decode(encoded.as_ref(), 0u8).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -82,7 +83,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = SeriesDictionaryValue::decode(&encoded, 1u8).unwrap();
+        let decoded = SeriesDictionaryValue::decode(encoded.as_ref(), 1u8).unwrap();
 
         // then
         assert_eq!(decoded, value);

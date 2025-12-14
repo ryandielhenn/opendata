@@ -1,6 +1,7 @@
 // ForwardIndex value structure with MetricMeta and AttributeBinding
 
 use super::common::*;
+use bytes::{Bytes, BytesMut};
 
 /// MetricMeta: Encodes the series' metric type and auxiliary flags
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,9 +25,8 @@ impl MetricMeta {
 }
 
 impl Encode for MetricMeta {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        buf.push(self.metric_type);
-        buf.push(self.flags);
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&[self.metric_type, self.flags]);
     }
 }
 
@@ -52,7 +52,7 @@ pub struct AttributeBinding {
 }
 
 impl Encode for AttributeBinding {
-    fn encode(&self, buf: &mut Vec<u8>) {
+    fn encode(&self, buf: &mut BytesMut) {
         encode_utf8(&self.attr, buf);
         encode_utf8(&self.value, buf);
     }
@@ -76,13 +76,13 @@ pub struct ForwardIndexValue {
 }
 
 impl ForwardIndexValue {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
         encode_optional_utf8(self.metric_unit.as_deref(), &mut buf);
         self.metric_meta.encode(&mut buf);
         buf.extend_from_slice(&self.attr_count.to_le_bytes());
         encode_array(&self.attrs, &mut buf);
-        buf
+        buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -147,7 +147,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = ForwardIndexValue::decode(&encoded).unwrap();
+        let decoded = ForwardIndexValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -171,7 +171,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = ForwardIndexValue::decode(&encoded).unwrap();
+        let decoded = ForwardIndexValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded, value);
@@ -194,7 +194,7 @@ mod tests {
 
         // when
         let encoded = value.encode();
-        let decoded = ForwardIndexValue::decode(&encoded).unwrap();
+        let decoded = ForwardIndexValue::decode(encoded.as_ref()).unwrap();
 
         // then
         assert_eq!(decoded, value);

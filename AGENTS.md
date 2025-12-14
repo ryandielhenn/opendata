@@ -58,9 +58,17 @@ fn should_return_error_when_key_not_found() {
 }
 ```
 
+### Encoding and Serialization
+
+- Prefer `bytes::Bytes` and `bytes::BytesMut` over `Vec<u8>` for byte buffers
+- Use `Bytes` for immutable byte slices (return types, function parameters)
+- Use `BytesMut` for mutable byte buffers during encoding
+- The `bytes` crate is available as a workspace dependency
+
 ### Dependencies
 
 - **slatedb**: The underlying storage engine for all database implementations
+- **bytes**: Byte buffer types (`Bytes`, `BytesMut`) for efficient zero-copy operations
 - Workspace dependencies are defined in the root `Cargo.toml`
 - Prefer adding dependencies at the workspace level when shared across crates
 
