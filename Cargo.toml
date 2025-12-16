@@ -15,6 +15,7 @@ async-trait = "0.1"
 bytes = "1.0"
 chrono = "0.4"
 dashmap = "6.1.0"
+fail = "0.5"
 opendata-common = { path = "./opendata-common" }
 rstest = "0.19"
 serde = { version = "1.0", features = ["derive"] }

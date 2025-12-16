@@ -105,7 +105,11 @@ impl TsdbHead {
 
         // Insert series dictionary entries
         for entry in self.series_dict.iter() {
-            ops.push(storage.insert_series(self.bucket.clone(), *entry.key(), *entry.value())?);
+            ops.push(storage.insert_series_id(
+                self.bucket.clone(),
+                *entry.key(),
+                *entry.value(),
+            )?);
         }
 
         // Insert forward index entries

@@ -1,15 +1,14 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use opendata_common::storage::RecordOp;
 use opendata_common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
+use crate::index::InvertedIndex;
 use crate::model::Sample;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesValue;
 use crate::{
-    index::{ForwardIndex, InvertedIndex},
+    index::ForwardIndex,
     model::{Attribute, SeriesFingerprint, SeriesId, SeriesSpec, TimeBucket},
     serde::{
         TimeBucketScoped,
@@ -21,6 +20,8 @@ use crate::{
     },
     util::Result,
 };
+
+pub(crate) mod merge_operator;
 
 /// Extension trait for StorageRead that provides OpenTSDB-specific loading methods
 #[async_trait]
@@ -124,8 +125,8 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         &self,
         bucket: &TimeBucket,
         terms: &[Attribute],
-    ) -> Result<HashMap<Attribute, RoaringBitmap>> {
-        let mut result = HashMap::new();
+    ) -> Result<InvertedIndex> {
+        let result = InvertedIndex::default();
         for term in terms {
             let key = InvertedIndexKey {
                 time_bucket: bucket.start,
@@ -136,7 +137,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             .encode();
             if let Some(record) = self.get(key).await? {
                 let value = InvertedIndexValue::decode(record.value.as_ref())?;
-                result.insert(term.clone(), value.postings);
+                result.postings.insert(term.clone(), value.postings);
             }
         }
         Ok(result)
@@ -148,8 +149,8 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         &self,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
-    ) -> Result<HashMap<SeriesId, SeriesSpec>> {
-        let mut result = HashMap::new();
+    ) -> Result<ForwardIndex> {
+        let result = ForwardIndex::default();
         for &series_id in series_ids {
             let key = ForwardIndexKey {
                 time_bucket: bucket.start,
@@ -159,7 +160,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
             .encode();
             if let Some(record) = self.get(key).await? {
                 let value = ForwardIndexValue::decode(record.value.as_ref())?;
-                result.insert(series_id, value.into());
+                result.series.insert(series_id, value.into());
             }
         }
         Ok(result)
@@ -202,7 +203,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         Ok(RecordOp::Merge(Record { key, value }))
     }
 
-    fn insert_series(
+    fn insert_series_id(
         &self,
         bucket: TimeBucket,
         fingerprint: SeriesFingerprint,

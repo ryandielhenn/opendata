@@ -1,12 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::VectorSelector;
-use roaring::RoaringBitmap;
 
 use crate::index::{ForwardIndex, InvertedIndex};
 use crate::minitsdb::MiniTsdb;
-use crate::model::{Attribute, SeriesId, SeriesSpec};
+use crate::model::{Attribute, SeriesId};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
@@ -47,20 +46,19 @@ pub(crate) async fn evaluate_selector(
         .get_inverted_index_terms(tsdb.bucket(), &terms)
         .await?;
 
-    let storage_candidates = find_candidates_from_map(&storage_inverted, &terms);
+    let storage_candidates: Vec<SeriesId> = storage_inverted.intersect(terms).iter().collect();
     let storage_result = if !storage_candidates.is_empty() && has_not_equal_matchers(selector) {
-        let series_ids: Vec<SeriesId> = storage_candidates.iter().copied().collect();
         let storage_forward = state
             .snapshot()
-            .get_forward_index_series(tsdb.bucket(), &series_ids)
+            .get_forward_index_series(tsdb.bucket(), &storage_candidates)
             .await?;
-        apply_not_equal_matchers_map(&storage_forward, storage_candidates, selector)
+        apply_not_equal_matchers(&storage_forward, storage_candidates, selector)
     } else {
         storage_candidates
     };
 
-    // Merge results from all layers
-    let mut result = head_result;
+    // Merge results from all layers and convert to HashSet
+    let mut result = HashSet::from_iter(head_result);
     result.extend(frozen_result);
     result.extend(storage_result);
     Ok(result)
@@ -71,13 +69,13 @@ fn evaluate_on_indexes(
     forward_index: &ForwardIndex,
     inverted_index: &InvertedIndex,
     selector: &VectorSelector,
-) -> HashSet<SeriesId> {
+) -> Vec<SeriesId> {
     let terms = extract_equality_terms(selector);
     if terms.is_empty() {
-        return HashSet::new();
+        return Vec::new();
     }
 
-    let candidates: HashSet<SeriesId> = inverted_index.intersect(terms).iter().collect();
+    let candidates: Vec<SeriesId> = inverted_index.intersect(terms).iter().collect();
     if candidates.is_empty() || !has_not_equal_matchers(selector) {
         return candidates;
     }
@@ -113,44 +111,20 @@ fn has_not_equal_matchers(selector: &VectorSelector) -> bool {
         .any(|m| matches!(m.op, MatchOp::NotEqual))
 }
 
-/// Find candidates by intersecting posting lists from a HashMap.
-fn find_candidates_from_map(
-    postings: &HashMap<Attribute, RoaringBitmap>,
-    terms: &[Attribute],
-) -> HashSet<SeriesId> {
-    if terms.is_empty() {
-        return HashSet::new();
-    }
-
-    let mut bitmaps: Vec<&RoaringBitmap> = Vec::new();
-    for term in terms {
-        match postings.get(term) {
-            Some(bitmap) => bitmaps.push(bitmap),
-            None => return HashSet::new(),
-        }
-    }
-
-    bitmaps.sort_by_key(|b| b.len());
-    let mut result = bitmaps[0].clone();
-    for bitmap in &bitmaps[1..] {
-        result &= *bitmap;
-    }
-    result.iter().collect()
-}
-
 /// Apply not-equal matchers using ForwardIndex.
 fn apply_not_equal_matchers(
     forward_index: &ForwardIndex,
-    mut candidates: HashSet<SeriesId>,
+    candidates: Vec<SeriesId>,
     selector: &VectorSelector,
-) -> HashSet<SeriesId> {
+) -> Vec<SeriesId> {
+    let mut result = candidates;
     for matcher in selector
         .matchers
         .matchers
         .iter()
         .filter(|m| matches!(m.op, MatchOp::NotEqual))
     {
-        candidates.retain(|id| {
+        result.retain(|id| {
             forward_index
                 .series
                 .get(id)
@@ -158,29 +132,7 @@ fn apply_not_equal_matchers(
                 .unwrap_or(false)
         });
     }
-    candidates
-}
-
-/// Apply not-equal matchers using a HashMap.
-fn apply_not_equal_matchers_map(
-    forward_index: &HashMap<SeriesId, SeriesSpec>,
-    mut candidates: HashSet<SeriesId>,
-    selector: &VectorSelector,
-) -> HashSet<SeriesId> {
-    for matcher in selector
-        .matchers
-        .matchers
-        .iter()
-        .filter(|m| matches!(m.op, MatchOp::NotEqual))
-    {
-        candidates.retain(|id| {
-            forward_index
-                .get(id)
-                .map(|spec| !has_attr(&spec.attributes, &matcher.name, &matcher.value))
-                .unwrap_or(false)
-        });
-    }
-    candidates
+    result
 }
 
 fn has_attr(attributes: &[Attribute], key: &str, value: &str) -> bool {
@@ -349,5 +301,113 @@ mod tests {
         let result = evaluate_on_indexes(&forward, &inverted, &selector);
 
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_merge_results_from_head_and_storage() {
+        use crate::minitsdb::MiniTsdb;
+        use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes, TimeBucket};
+        use crate::storage::merge_operator::OpenTsdbMergeOperator;
+        use opendata_common::storage::in_memory::InMemoryStorage;
+        use std::sync::Arc;
+
+        // given: create a tsdb with storage that has the OpenTSDB merge operator
+        let bucket = TimeBucket::hour(1000);
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let storage_read: Arc<dyn opendata_common::StorageRead> = storage.clone();
+        let tsdb = MiniTsdb::load(bucket.clone(), storage_read).await.unwrap();
+
+        // Ingest data and flush to storage (series with env=prod)
+        let storage_samples = vec![
+            SampleWithAttributes {
+                attributes: vec![
+                    Attribute {
+                        key: METRIC_NAME.to_string(),
+                        value: "http_requests_total".to_string(),
+                    },
+                    Attribute {
+                        key: "env".to_string(),
+                        value: "prod".to_string(),
+                    },
+                    Attribute {
+                        key: "method".to_string(),
+                        value: "GET".to_string(),
+                    },
+                ],
+                metric_unit: None,
+                metric_type: MetricType::Gauge,
+                sample: Sample {
+                    timestamp: 1000,
+                    value: 10.0,
+                },
+            },
+            SampleWithAttributes {
+                attributes: vec![
+                    Attribute {
+                        key: METRIC_NAME.to_string(),
+                        value: "http_requests_total".to_string(),
+                    },
+                    Attribute {
+                        key: "env".to_string(),
+                        value: "prod".to_string(),
+                    },
+                    Attribute {
+                        key: "method".to_string(),
+                        value: "POST".to_string(),
+                    },
+                ],
+                metric_unit: None,
+                metric_type: MetricType::Gauge,
+                sample: Sample {
+                    timestamp: 1001,
+                    value: 20.0,
+                },
+            },
+        ];
+        tsdb.ingest(storage_samples).await.unwrap();
+        tsdb.flush(storage.clone()).await.unwrap();
+
+        // Ingest more data into head (series with env=staging)
+        let head_samples = vec![SampleWithAttributes {
+            attributes: vec![
+                Attribute {
+                    key: METRIC_NAME.to_string(),
+                    value: "http_requests_total".to_string(),
+                },
+                Attribute {
+                    key: "env".to_string(),
+                    value: "staging".to_string(),
+                },
+                Attribute {
+                    key: "method".to_string(),
+                    value: "GET".to_string(),
+                },
+            ],
+            metric_unit: None,
+            metric_type: MetricType::Gauge,
+            sample: Sample {
+                timestamp: 2000,
+                value: 30.0,
+            },
+        }];
+        tsdb.ingest(head_samples).await.unwrap();
+
+        // when: query for all http_requests_total series
+        let selector = VectorSelector {
+            name: Some("http_requests_total".to_string()),
+            matchers: empty_matchers(),
+            offset: None,
+            at: None,
+        };
+        let result = evaluate_selector(&tsdb, &selector).await.unwrap();
+
+        // then: should find series from both head and storage
+        assert_eq!(
+            result.len(),
+            3,
+            "Should find 3 series total (2 from storage, 1 from head)"
+        );
     }
 }

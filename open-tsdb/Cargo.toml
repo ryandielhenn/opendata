@@ -23,4 +23,5 @@ roaring = "0.7"
 tsz = "0.1"
 
 [dev-dependencies]
+fail.workspace = true
 rstest.workspace = true

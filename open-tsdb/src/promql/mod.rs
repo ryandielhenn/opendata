@@ -3,4 +3,4 @@ mod parser;
 mod request;
 mod response;
 mod router;
-mod selector;
+pub(crate) mod selector;

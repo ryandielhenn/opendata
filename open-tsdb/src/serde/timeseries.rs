@@ -125,6 +125,47 @@ impl<'a> TszRead for BytesReader<'a> {
     }
 }
 
+/// Iterator over time series samples from Gorilla-compressed data.
+///
+/// This iterator lazily decodes samples from the compressed format without
+/// materializing the full series in memory.
+pub(crate) struct TimeSeriesIterator<'a> {
+    decoder: StdDecoder<BytesReader<'a>>,
+}
+
+impl<'a> TimeSeriesIterator<'a> {
+    /// Creates a new iterator from compressed time series bytes.
+    ///
+    /// Returns None if the bytes represent an empty series.
+    pub fn new(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+
+        let reader = BytesReader::new(bytes);
+        let decoder = StdDecoder::new(reader);
+
+        Some(TimeSeriesIterator { decoder })
+    }
+}
+
+impl<'a> Iterator for TimeSeriesIterator<'a> {
+    type Item = Result<Sample, EncodingError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.decoder.next() {
+            Ok(dp) => Some(Ok(Sample {
+                timestamp: dp.get_time(),
+                value: dp.get_value(),
+            })),
+            Err(tsz::decode::Error::EndOfStream) => None,
+            Err(e) => Some(Err(EncodingError {
+                message: format!("Gorilla decoding failed: {}", e),
+            })),
+        }
+    }
+}
+
 /// TimeSeries value: Gorilla-compressed stream of (timestamp_ms, value) pairs
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeSeriesValue {
@@ -159,29 +200,103 @@ impl TimeSeriesValue {
             return Ok(TimeSeriesValue { points: vec![] });
         }
 
-        let reader = BytesReader::new(buf);
-        let mut decoder = StdDecoder::new(reader);
-
-        let mut points = Vec::new();
-        loop {
-            match decoder.next() {
-                Ok(dp) => {
-                    points.push(Sample {
-                        timestamp: dp.get_time(),
-                        value: dp.get_value(),
-                    });
-                }
-                Err(tsz::decode::Error::EndOfStream) => break,
-                Err(e) => {
-                    return Err(EncodingError {
-                        message: format!("Gorilla decoding failed: {}", e),
-                    });
-                }
-            }
-        }
+        // Use the iterator to collect points
+        let points = match TimeSeriesIterator::new(buf) {
+            None => vec![], // Empty series
+            Some(iter) => iter.collect::<Result<Vec<_>, _>>()?,
+        };
 
         Ok(TimeSeriesValue { points })
     }
+}
+
+/// Merges two compressed time series byte values into a single compressed value.
+///
+/// This function performs an efficient sorted merge of two Gorilla-compressed time series
+/// without fully deserializing them into memory. Samples are merged in timestamp order,
+/// with duplicates resolved by keeping the value from `other` (last write wins).
+///
+/// This is designed for use in merge operators during compaction.
+///
+/// # Arguments
+///
+/// * `base` - The base compressed time series value
+/// * `other` - The time series value to merge into the base
+///
+/// # Returns
+///
+/// A new compressed `Bytes` value containing the merged series
+pub(crate) fn merge_time_series(base: Bytes, other: Bytes) -> Result<Bytes, EncodingError> {
+    // Handle empty cases
+    if base.is_empty() {
+        return Ok(other);
+    }
+    if other.is_empty() {
+        return Ok(base);
+    }
+
+    // Create iterators for both series
+    let mut base_iter =
+        TimeSeriesIterator::new(base.as_ref()).expect("Base series should not be empty");
+    let mut other_iter =
+        TimeSeriesIterator::new(other.as_ref()).expect("Other series should not be empty");
+
+    // Get first sample from each iterator to determine the earliest timestamp
+    let mut base_sample = base_iter.next().transpose()?;
+    let mut other_sample = other_iter.next().transpose()?;
+
+    let start_time = match (&base_sample, &other_sample) {
+        (Some(bs), Some(os)) => bs.timestamp.min(os.timestamp),
+        (Some(bs), None) => bs.timestamp,
+        (None, Some(os)) => os.timestamp,
+        (None, None) => {
+            // Both iterators returned None immediately - treat as empty
+            return Ok(Bytes::new());
+        }
+    };
+
+    // Create encoder for output
+    let writer = BufferedWriter::new();
+    let mut encoder = StdEncoder::new(start_time, writer);
+
+    // Sorted merge with deduplication (keeping 'other' value on timestamp collision)
+    while base_sample.is_some() || other_sample.is_some() {
+        match (&base_sample, &other_sample) {
+            (Some(bs), Some(os)) => {
+                if bs.timestamp < os.timestamp {
+                    // Take from base
+                    encoder.encode(DataPoint::new(bs.timestamp, bs.value));
+                    base_sample = base_iter.next().transpose()?;
+                } else if bs.timestamp > os.timestamp {
+                    // Take from other
+                    encoder.encode(DataPoint::new(os.timestamp, os.value));
+                    other_sample = other_iter.next().transpose()?;
+                } else {
+                    // Equal timestamps: take from other (last write wins)
+                    encoder.encode(DataPoint::new(os.timestamp, os.value));
+                    base_sample = base_iter.next().transpose()?;
+                    other_sample = other_iter.next().transpose()?;
+                }
+            }
+            (Some(bs), None) => {
+                // Only base remaining
+                encoder.encode(DataPoint::new(bs.timestamp, bs.value));
+                base_sample = base_iter.next().transpose()?;
+            }
+            (None, Some(os)) => {
+                // Only other remaining
+                encoder.encode(DataPoint::new(os.timestamp, os.value));
+                other_sample = other_iter.next().transpose()?;
+            }
+            (None, None) => break,
+        }
+    }
+
+    // Close encoder to get compressed data
+    let compressed = encoder.close();
+
+    // Convert directly to Bytes without copying
+    Ok(Bytes::from(compressed))
 }
 
 #[cfg(test)]
@@ -281,5 +396,113 @@ mod tests {
         assert_eq!(decoded.points[1].value, f64::NEG_INFINITY);
         assert_eq!(decoded.points[2].value, 0.0);
         assert_eq!(decoded.points[3].value, -0.0);
+    }
+
+    #[test]
+    fn should_merge_time_series_with_deduplication() {
+        // given: two time series with overlapping timestamps
+        let base = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp: 2000,
+                    value: 20.0,
+                },
+                Sample {
+                    timestamp: 3000,
+                    value: 30.0,
+                },
+            ],
+        };
+        let base_bytes = base.encode().unwrap();
+
+        let other = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp: 2000,
+                    value: 200.0, // Should override base's 20.0
+                },
+                Sample {
+                    timestamp: 3000,
+                    value: 300.0, // Should override base's 30.0
+                },
+                Sample {
+                    timestamp: 4000,
+                    value: 40.0,
+                },
+            ],
+        };
+        let other_bytes = other.encode().unwrap();
+
+        // when: merge the series
+        let merged_bytes = merge_time_series(base_bytes, other_bytes).unwrap();
+        let merged = TimeSeriesValue::decode(merged_bytes.as_ref()).unwrap();
+
+        // then: should have 4 points with duplicates resolved (last write wins)
+        assert_eq!(merged.points.len(), 4);
+        assert_eq!(merged.points[0].timestamp, 1000);
+        assert_eq!(merged.points[0].value, 10.0); // From base
+        assert_eq!(merged.points[1].timestamp, 2000);
+        assert_eq!(merged.points[1].value, 200.0); // From other (overrides base)
+        assert_eq!(merged.points[2].timestamp, 3000);
+        assert_eq!(merged.points[2].value, 300.0); // From other (overrides base)
+        assert_eq!(merged.points[3].timestamp, 4000);
+        assert_eq!(merged.points[3].value, 40.0); // From other
+    }
+
+    #[test]
+    fn should_merge_time_series_interleaved() {
+        // given: two time series with interleaved timestamps
+        let base = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp: 3000,
+                    value: 30.0,
+                },
+                Sample {
+                    timestamp: 5000,
+                    value: 50.0,
+                },
+            ],
+        };
+        let base_bytes = base.encode().unwrap();
+
+        let other = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp: 2000,
+                    value: 20.0,
+                },
+                Sample {
+                    timestamp: 4000,
+                    value: 40.0,
+                },
+                Sample {
+                    timestamp: 6000,
+                    value: 60.0,
+                },
+            ],
+        };
+        let other_bytes = other.encode().unwrap();
+
+        // when: merge the series
+        let merged_bytes = merge_time_series(base_bytes, other_bytes).unwrap();
+        let merged = TimeSeriesValue::decode(merged_bytes.as_ref()).unwrap();
+
+        // then: should have all 6 points in sorted order
+        assert_eq!(merged.points.len(), 6);
+        assert_eq!(merged.points[0].timestamp, 1000);
+        assert_eq!(merged.points[1].timestamp, 2000);
+        assert_eq!(merged.points[2].timestamp, 3000);
+        assert_eq!(merged.points[3].timestamp, 4000);
+        assert_eq!(merged.points[4].timestamp, 5000);
+        assert_eq!(merged.points[5].timestamp, 6000);
     }
 }

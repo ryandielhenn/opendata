@@ -63,42 +63,51 @@ impl<'a> TsdbDeltaBuilder<'a> {
 
         let fingerprint = attributes.fingerprint();
 
-        // register the series in the delta if it's not already present
-        // in either the series dictionary or the delta series dictionary
-        // (the latter is one that we've registered during building this
-        // delta)
-        let series_id = self
+        // Fast path: check local delta first (for samples in the same batch)
+        if let Some(&series_id) = self.series_dict_delta.get(&fingerprint) {
+            self.samples.entry(series_id).or_default().push(sample);
+            return;
+        }
+
+        // Atomic get-or-create in the shared dictionary. This ensures that
+        // concurrent ingest() calls will not create duplicate series IDs
+        // for the same fingerprint.
+        #[cfg(test)]
+        fail::fail_point!("delta_before_entry");
+
+        let mut is_new = false;
+        let series_id = *self
             .series_dict
-            .get(&fingerprint)
-            .map(|r| *r.value())
-            .or_else(|| self.series_dict_delta.get(&fingerprint).copied())
-            .unwrap_or_else(|| {
-                let series_id = self.next_series_id.fetch_add(1, Ordering::SeqCst);
+            .entry(fingerprint)
+            .or_insert_with(|| {
+                is_new = true;
+                self.next_series_id.fetch_add(1, Ordering::SeqCst)
+            })
+            .value();
 
-                self.series_dict_delta.insert(fingerprint, series_id);
+        // Only update indexes if WE created this series
+        if is_new {
+            self.series_dict_delta.insert(fingerprint, series_id);
 
-                let series_spec = SeriesSpec {
-                    metric_unit: metric_unit.clone(),
-                    metric_type,
-                    attributes: attributes.clone(),
-                };
+            let series_spec = SeriesSpec {
+                metric_unit: metric_unit.clone(),
+                metric_type,
+                attributes: attributes.clone(),
+            };
 
-                self.forward_index.series.insert(series_id, series_spec);
+            self.forward_index.series.insert(series_id, series_spec);
 
-                for attr in &attributes {
-                    let mut entry = self
-                        .inverted_index
-                        .postings
-                        .entry(attr.clone())
-                        .or_default();
-                    entry.value_mut().insert(series_id);
-                }
+            for attr in &attributes {
+                self.inverted_index
+                    .postings
+                    .entry(attr.clone())
+                    .or_default()
+                    .value_mut()
+                    .insert(series_id);
+            }
+        }
 
-                series_id
-            });
-
-        let entry = self.samples.entry(series_id).or_default();
-        entry.push(sample);
+        self.samples.entry(series_id).or_default().push(sample);
     }
 
     pub(crate) fn build(self) -> TsdbDelta {
@@ -517,5 +526,111 @@ mod tests {
             (MetricType::Gauge, MetricType::Gauge) => {}
             _ => panic!("Metric types don't match"),
         }
+    }
+
+    #[test]
+    fn should_serialize_concurrent_ingests_for_same_fingerprint() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // given
+        let bucket = create_test_bucket();
+        let series_dict = Arc::new(DashMap::new());
+        let next_series_id = Arc::new(AtomicU32::new(0));
+        let attributes = create_test_attributes();
+
+        // Setup barrier for 2 threads to synchronize at the failpoint
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+
+        fail::cfg_callback("delta_before_entry", move || {
+            barrier_clone.wait();
+        })
+        .unwrap();
+
+        // when: spawn two threads that will race to create the same series
+        let series_dict_a = series_dict.clone();
+        let next_series_id_a = next_series_id.clone();
+        let attributes_a = attributes.clone();
+        let bucket_a = bucket.clone();
+
+        let handle_a = thread::spawn(move || {
+            let mut builder = TsdbDeltaBuilder::new(bucket_a, &series_dict_a, &next_series_id_a);
+            builder.ingest_sample(
+                attributes_a,
+                Some("bytes".to_string()),
+                MetricType::Gauge,
+                Sample {
+                    timestamp: 1000,
+                    value: 42.0,
+                },
+            );
+            builder.build()
+        });
+
+        let series_dict_b = series_dict.clone();
+        let next_series_id_b = next_series_id.clone();
+        let attributes_b = attributes.clone();
+        let bucket_b = bucket.clone();
+
+        let handle_b = thread::spawn(move || {
+            let mut builder = TsdbDeltaBuilder::new(bucket_b, &series_dict_b, &next_series_id_b);
+            builder.ingest_sample(
+                attributes_b,
+                Some("bytes".to_string()),
+                MetricType::Gauge,
+                Sample {
+                    timestamp: 2000,
+                    value: 43.0,
+                },
+            );
+            builder.build()
+        });
+
+        let delta_a = handle_a.join().unwrap();
+        let delta_b = handle_b.join().unwrap();
+
+        // Cleanup failpoint
+        fail::remove("delta_before_entry");
+
+        // then: only ONE series ID should have been assigned
+        assert_eq!(
+            next_series_id.load(Ordering::SeqCst),
+            1,
+            "Both threads should have used the same series ID"
+        );
+
+        // The shared series_dict should have exactly one entry
+        assert_eq!(series_dict.len(), 1);
+
+        // Both deltas should reference series_id 0
+        // Note: only the "winner" will have series_dict_delta populated
+        // The "loser" will have an empty series_dict_delta but still have samples
+        let total_series_dict_entries = delta_a.series_dict.len() + delta_b.series_dict.len();
+        assert_eq!(
+            total_series_dict_entries, 1,
+            "Only one thread should have created the series entry"
+        );
+
+        // Both deltas should have their respective samples for series_id 0
+        let samples_a = delta_a
+            .samples
+            .get(&0)
+            .expect("delta_a should have samples for series 0");
+        assert_eq!(samples_a.len(), 1);
+        assert_eq!(
+            samples_a[0].value, 42.0,
+            "delta_a should have sample with value 42.0"
+        );
+
+        let samples_b = delta_b
+            .samples
+            .get(&0)
+            .expect("delta_b should have samples for series 0");
+        assert_eq!(samples_b.len(), 1);
+        assert_eq!(
+            samples_b[0].value, 43.0,
+            "delta_b should have sample with value 43.0"
+        );
     }
 }
