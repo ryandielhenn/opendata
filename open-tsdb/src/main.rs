@@ -1,8 +1,8 @@
 #![allow(dead_code)]
-mod db;
 mod delta;
 mod head;
 mod index;
+mod minitsdb;
 mod model;
 mod otel;
 mod promql;

@@ -22,7 +22,7 @@
 use std::sync::{Arc, atomic::AtomicU32};
 
 use dashmap::DashMap;
-use opendata_common::{Storage, storage::StorageSnapshot};
+use opendata_common::{Storage, StorageRead};
 use opentelemetry_proto::tonic::metrics::v1::MetricsData;
 use tokio::sync::{Mutex, RwLock};
 
@@ -34,13 +34,30 @@ use crate::{
     model::{SeriesFingerprint, SeriesId, TimeBucket},
 };
 
-pub(crate) struct TsdbState {
+pub(crate) struct MiniState {
     head: TsdbHead,
     frozen_head: Option<TsdbHead>,
-    storage_snapshot: Arc<dyn StorageSnapshot>,
+    snapshot: Arc<dyn StorageRead>,
 }
 
-pub(crate) struct Tsdb {
+impl MiniState {
+    /// Returns a reference to the head
+    pub(crate) fn head(&self) -> &TsdbHead {
+        &self.head
+    }
+
+    /// Returns a reference to the frozen head, if any
+    pub(crate) fn frozen_head(&self) -> Option<&TsdbHead> {
+        self.frozen_head.as_ref()
+    }
+
+    /// Returns a reference to the storage snapshot
+    pub(crate) fn snapshot(&self) -> &Arc<dyn StorageRead> {
+        &self.snapshot
+    }
+}
+
+pub(crate) struct MiniTsdb {
     bucket: TimeBucket,
     series_dict: DashMap<SeriesFingerprint, SeriesId>,
     next_series_id: AtomicU32,
@@ -49,14 +66,24 @@ pub(crate) struct Tsdb {
     /// storage snapshot. Note that only the read lock is
     /// required for queries and ingestion (which modifies the
     /// underlying data structures in a thread-safe way)
-    state: Arc<RwLock<TsdbState>>,
+    state: Arc<RwLock<MiniState>>,
     /// Mutex to ensure only one flush operation can run at a time.
     /// This prevents concurrent flushes from interfering with each other.
     flush_mutex: Arc<Mutex<()>>,
 }
 
-impl Tsdb {
-    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn Storage>) -> Result<Self> {
+impl MiniTsdb {
+    /// Returns a reference to the time bucket
+    pub(crate) fn bucket(&self) -> &TimeBucket {
+        &self.bucket
+    }
+
+    /// Returns a reference to the internal state (protected by RwLock)
+    pub(crate) fn state(&self) -> &Arc<RwLock<MiniState>> {
+        &self.state
+    }
+
+    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Result<Self> {
         let series_dict = DashMap::new();
         let next_series_id = storage
             .load_series_dictionary(&bucket, |fingerprint, series_id| {
@@ -68,10 +95,10 @@ impl Tsdb {
             bucket: bucket.clone(),
             series_dict,
             next_series_id: AtomicU32::new(next_series_id),
-            state: Arc::new(RwLock::new(TsdbState {
+            state: Arc::new(RwLock::new(MiniState {
                 head: TsdbHead::new(bucket.clone()),
                 frozen_head: None,
-                storage_snapshot: storage.snapshot().await?,
+                snapshot: storage,
             })),
             flush_mutex: Arc::new(Mutex::new(())),
         })
@@ -92,7 +119,7 @@ impl Tsdb {
     pub(crate) async fn ingest_delta(&self, delta: &TsdbDelta) -> Result<()> {
         // TODO(agavra): log the delta to a WAL to avoid losing data
         let state = self.state.read().await;
-        state.head.merge(&delta)?;
+        state.head.merge(delta)?;
         Ok(())
     }
 
@@ -131,7 +158,7 @@ impl Tsdb {
         // discard the frozen head
         {
             let mut state = self.state.write().await;
-            state.storage_snapshot = snapshot;
+            state.snapshot = snapshot;
             state.frozen_head = None;
         }
         Ok(())

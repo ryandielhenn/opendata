@@ -52,6 +52,16 @@ impl TsdbHead {
         &self.bucket
     }
 
+    /// Returns a reference to the forward index
+    pub fn forward_index(&self) -> &ForwardIndex {
+        &self.forward_index
+    }
+
+    /// Returns a reference to the inverted index
+    pub fn inverted_index(&self) -> &InvertedIndex {
+        &self.inverted_index
+    }
+
     pub fn merge(&self, delta: &TsdbDelta) -> Result<()> {
         if self.frozen.load(Ordering::SeqCst) {
             return Err(OpenTsdbError::Internal("TsdbHead is frozen".to_string()));

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use opendata_common::storage::RecordOp;
 use opendata_common::{Record, Storage, StorageRead};
@@ -114,6 +116,53 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         }
 
         Ok(inverted_index)
+    }
+
+    /// Load only the specified terms from the inverted index.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_inverted_index_terms(
+        &self,
+        bucket: &TimeBucket,
+        terms: &[Attribute],
+    ) -> Result<HashMap<Attribute, RoaringBitmap>> {
+        let mut result = HashMap::new();
+        for term in terms {
+            let key = InvertedIndexKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                attribute: term.key.clone(),
+                value: term.value.clone(),
+            }
+            .encode();
+            if let Some(record) = self.get(key).await? {
+                let value = InvertedIndexValue::decode(record.value.as_ref())?;
+                result.insert(term.clone(), value.postings);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Load only the specified series from the forward index.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_forward_index_series(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<HashMap<SeriesId, SeriesSpec>> {
+        let mut result = HashMap::new();
+        for &series_id in series_ids {
+            let key = ForwardIndexKey {
+                time_bucket: bucket.start,
+                bucket_size: bucket.size,
+                series_id,
+            }
+            .encode();
+            if let Some(record) = self.get(key).await? {
+                let value = ForwardIndexValue::decode(record.value.as_ref())?;
+                result.insert(series_id, value.into());
+            }
+        }
+        Ok(result)
     }
 
     /// Load the series dictionary using the provided insert function and
