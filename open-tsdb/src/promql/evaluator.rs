@@ -10,12 +10,10 @@ use promql_parser::parser::{
     VectorMatchCardinality, VectorSelector,
 };
 
-use crate::minitsdb::{MiniState, MiniTsdb};
-use crate::model::{Attribute, SeriesFingerprint, SeriesId, SeriesSpec};
+use crate::index::ForwardIndexLookup;
+use crate::model::{Attribute, SeriesFingerprint};
 use crate::promql::functions::FunctionRegistry;
-use crate::serde::key::TimeSeriesKey;
-use crate::serde::timeseries::TimeSeriesIterator;
-use crate::storage::OpenTsdbStorageReadExt;
+use crate::query::QueryReader;
 
 #[derive(Debug)]
 pub enum EvaluationError {
@@ -50,8 +48,8 @@ pub struct EvalSample {
     pub(crate) labels: HashMap<String, String>,
 }
 
-pub(crate) struct Evaluator {
-    tsdb: MiniTsdb,
+pub(crate) struct Evaluator<'a, R: QueryReader> {
+    reader: &'a R,
 }
 
 enum ExprResult {
@@ -59,9 +57,9 @@ enum ExprResult {
     InstantVector(Vec<EvalSample>),
 }
 
-impl Evaluator {
-    pub(crate) fn new(tsdb: MiniTsdb) -> Self {
-        Self { tsdb }
+impl<'a, R: QueryReader> Evaluator<'a, R> {
+    pub(crate) fn new(reader: &'a R) -> Self {
+        Self { reader }
     }
 
     pub(crate) async fn evaluate(&self, stmt: EvalStmt) -> EvalResult<Vec<EvalSample>> {
@@ -84,14 +82,14 @@ impl Evaluator {
 
     // this call recurses to evaluate sub-expressions, so it needs to return a boxed future
     // so that the return type is sized (so can be stack-allocated)
-    fn evaluate_expr<'a>(
-        &'a self,
-        expr: &'a Expr,
+    fn evaluate_expr<'b>(
+        &'b self,
+        expr: &'b Expr,
         start: SystemTime,
         end: SystemTime,
         interval: Duration,
         lookback_delta: Duration,
-    ) -> Pin<Box<dyn Future<Output = EvalResult<ExprResult>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = EvalResult<ExprResult>> + Send + 'b>> {
         match expr {
             Expr::Aggregate(aggregate) => {
                 let fut = self.evaluate_aggregate(aggregate, start, end, interval, lookback_delta);
@@ -157,21 +155,30 @@ impl Evaluator {
             .as_millis() as u64;
         let start_ms = end_ms - (lookback_delta.as_millis() as u64);
 
-        // TODO(multi-bucket): Support querying across multiple buckets
-        // For now, we work with a single MiniTsdb instance (single bucket)
-        let state = self.tsdb.state().read().await;
-
         // Use the selector module to find matching series
-        let candidates = crate::promql::selector::evaluate_selector(&self.tsdb, vector_selector)
-            .await
-            .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+        let candidates =
+            crate::promql::selector::evaluate_selector_with_reader(self.reader, vector_selector)
+                .await
+                .map_err(|e| EvaluationError::InternalError(e.to_string()))?;
+
+        // Batch load forward index for all candidates upfront
+        let candidates_vec: Vec<_> = candidates.into_iter().collect();
+        let forward_index_view = self.reader.forward_index_view(&candidates_vec).await?;
 
         let mut series_with_results: HashSet<SeriesFingerprint> = HashSet::new();
         let mut samples = Vec::new();
 
-        for series_id in candidates {
-            // Get series spec from forward index to resolve labels
-            let series_spec = self.get_series_spec(&state, series_id).await?;
+        for series_id in candidates_vec {
+            // Get series spec from forward index view (batched lookup)
+            let series_spec = match forward_index_view.get_spec(&series_id) {
+                Some(spec) => spec,
+                None => {
+                    return Err(EvaluationError::InternalError(format!(
+                        "Series {} not found in any layer",
+                        series_id
+                    )));
+                }
+            };
             let fingerprint = self.compute_fingerprint(&series_spec.attributes);
 
             if series_with_results.contains(&fingerprint) {
@@ -179,17 +186,16 @@ impl Evaluator {
             }
 
             // Read and merge timeseries data from all layers
-            let best_point = self
-                .read_timeseries_for_series(&state, series_id, start_ms, end_ms)
-                .await?;
+            let sample_data = self.reader.get_samples(series_id, start_ms, end_ms).await?;
 
-            if let Some((timestamp_ms, value)) = best_point {
+            // Find the best (latest) point in the time range
+            if let Some(best_sample) = sample_data.last() {
                 // Convert attributes to labels HashMap
                 let labels = self.attributes_to_labels(&series_spec.attributes);
 
                 samples.push(EvalSample {
-                    timestamp_ms,
-                    value,
+                    timestamp_ms: best_sample.timestamp,
+                    value: best_sample.value,
                     labels,
                 });
 
@@ -198,144 +204,6 @@ impl Evaluator {
         }
 
         Ok(ExprResult::InstantVector(samples))
-    }
-
-    /// Read timeseries data for a series across all layers (head, frozen head, storage)
-    /// and return the best point within the time range using a heap-based merge.
-    async fn read_timeseries_for_series(
-        &self,
-        state: &MiniState,
-        series_id: SeriesId,
-        start_ms: u64,
-        end_ms: u64,
-    ) -> EvalResult<Option<(u64, f64)>> {
-        let bucket = self.tsdb.bucket();
-
-        // Storage samples - need to read from storage
-        let storage_key = TimeSeriesKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
-            series_id,
-        };
-        let storage_record = state
-            .snapshot()
-            .get(storage_key.encode())
-            .await
-            .map_err(|e| EvaluationError::StorageError(e.to_string()))?;
-        // Collect storage samples immediately to avoid lifetime issues
-        let storage_samples: Vec<crate::model::Sample> = if let Some(record) = storage_record {
-            if let Some(iter) = TimeSeriesIterator::new(record.value.as_ref()) {
-                iter.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        EvaluationError::InternalError(format!(
-                            "Error decoding timeseries from storage: {}",
-                            e
-                        ))
-                    })?
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Collect samples from all layers, then merge
-        // Since each layer's samples are already sorted, we can collect and merge efficiently
-        let mut all_samples: Vec<(u64, f64, u8)> = Vec::new(); // (timestamp_ms, value, priority)
-
-        // Collect head samples
-        if let Some(head_samples_ref) = state.head().samples().get(&series_id) {
-            for sample in head_samples_ref.iter() {
-                all_samples.push((sample.timestamp, sample.value, 0)); // priority 0 = head
-            }
-        }
-
-        // Collect frozen head samples
-        if let Some(frozen) = state.frozen_head()
-            && let Some(frozen_samples_ref) = frozen.samples().get(&series_id)
-        {
-            for sample in frozen_samples_ref.iter() {
-                all_samples.push((sample.timestamp, sample.value, 1)); // priority 1 = frozen
-            }
-        }
-
-        // Collect storage samples
-        for sample in storage_samples {
-            all_samples.push((sample.timestamp, sample.value, 2)); // priority 2 = storage
-        }
-
-        // Sort by timestamp (ascending), then by priority (ascending) for deduplication
-        all_samples.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)) // Lower priority number = higher priority
-        });
-
-        // Deduplicate: for same timestamp, keep only the one with highest priority (lowest number)
-        let mut deduped_samples: Vec<(u64, f64)> = Vec::new();
-        let mut last_timestamp: Option<u64> = None;
-        for (timestamp_ms, value, _priority) in all_samples {
-            if let Some(last_ts) = last_timestamp
-                && timestamp_ms == last_ts
-            {
-                // Skip duplicates (we already have the one with better priority due to sorting)
-                continue;
-            }
-            deduped_samples.push((timestamp_ms, value));
-            last_timestamp = Some(timestamp_ms);
-        }
-
-        // Find best point within time range
-        // PromQL lookback window semantics:
-        // - End (evaluation time): inclusive (samples "before or at" evaluation time)
-        // - Start (evaluation time - lookback_delta): following aion implementation pattern,
-        //   we use exclusive start (timestamp > start_ms) to match the ported codebase.
-        //   This means samples exactly at (evaluation_time - lookback_delta) are excluded.
-        // TODO: Verify against official Prometheus source code if start boundary should be inclusive
-        let mut best_point: Option<(u64, f64)> = None;
-        for (timestamp_ms, value) in deduped_samples {
-            // Filter by time range: timestamp > start_ms && timestamp <= end_ms
-            if timestamp_ms > start_ms
-                && timestamp_ms <= end_ms
-                && (best_point.is_none() || timestamp_ms > best_point.unwrap().0)
-            {
-                best_point = Some((timestamp_ms, value));
-            }
-        }
-
-        Ok(best_point)
-    }
-
-    /// Get series spec from forward index, checking head, frozen head, and storage
-    async fn get_series_spec(
-        &self,
-        state: &MiniState,
-        series_id: SeriesId,
-    ) -> EvalResult<SeriesSpec> {
-        // Check head first
-        if let Some(spec) = state.head().forward_index().series.get(&series_id) {
-            return Ok(spec.value().clone());
-        }
-
-        // Check frozen head
-        if let Some(frozen) = state.frozen_head()
-            && let Some(spec) = frozen.forward_index().series.get(&series_id)
-        {
-            return Ok(spec.value().clone());
-        }
-
-        // Check storage
-        let bucket = self.tsdb.bucket();
-        let forward_index = state
-            .snapshot()
-            .get_forward_index_series(bucket, &[series_id])
-            .await?;
-        if let Some(spec) = forward_index.series.get(&series_id) {
-            return Ok(spec.value().clone());
-        }
-
-        Err(EvaluationError::InternalError(format!(
-            "Series {} not found in any layer",
-            series_id
-        )))
     }
 
     /// Convert attributes to labels HashMap
@@ -379,8 +247,14 @@ impl Evaluator {
             EvaluationError::InternalError(format!("Unknown function: {}", call.func.name))
         })?;
 
-        // Apply the function
-        let result = func.apply(arg_samples)?;
+        // Calculate evaluation timestamp in milliseconds
+        let eval_timestamp_ms = end
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Apply the function with the evaluation timestamp
+        let result = func.apply(arg_samples, eval_timestamp_ms)?;
         Ok(ExprResult::InstantVector(result))
     }
 
@@ -680,14 +554,11 @@ impl Evaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minitsdb::MiniTsdb;
-    use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes, TimeBucket};
-    use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use opendata_common::storage::in_memory::InMemoryStorage;
+    use crate::model::{Attribute, MetricType, Sample, TimeBucket};
+    use crate::query::test_utils::MockQueryReaderBuilder;
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::EvalStmt;
     use rstest::rstest;
-    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const EPSILON: f64 = 1e-10;
@@ -701,8 +572,8 @@ mod tests {
     }
 
     /// Helper to parse a PromQL query and evaluate it
-    async fn parse_and_evaluate(
-        evaluator: &Evaluator,
+    async fn parse_and_evaluate<R: QueryReader>(
+        evaluator: &Evaluator<'_, R>,
         query: &str,
         end_time: SystemTime,
         lookback_delta: Duration,
@@ -784,15 +655,8 @@ mod tests {
         }
     }
 
-    /// Helper to create a sample from a simple format:
-    /// (metric_name, labels_vec, timestamp_offset_ms, value)
-    fn create_sample(
-        metric_name: &str,
-        labels: Vec<(&str, &str)>,
-        timestamp_offset_ms: u64,
-        value: f64,
-        base_timestamp: u64,
-    ) -> SampleWithAttributes {
+    /// Helper to create attributes from metric name and labels
+    fn create_attributes(metric_name: &str, labels: Vec<(&str, &str)>) -> Vec<Attribute> {
         let mut attributes = vec![Attribute {
             key: METRIC_NAME.to_string(),
             value: metric_name.to_string(),
@@ -803,27 +667,17 @@ mod tests {
                 value: val.to_string(),
             });
         }
-        SampleWithAttributes {
-            attributes,
-            metric_unit: None,
-            metric_type: MetricType::Gauge,
-            sample: Sample {
-                timestamp: base_timestamp + timestamp_offset_ms,
-                value,
-            },
-        }
+        attributes
     }
 
-    /// Setup helper: Creates a MiniTsdb with test data
+    /// Setup helper: Creates a MockQueryReader with test data
     /// data: Vec of (metric_name, labels, timestamp_offset_ms, value)
-    /// Returns (Evaluator, end_time) where end_time is suitable for querying
-    async fn setup_tsdb_with_samples(data: TestSampleData) -> (Evaluator, SystemTime) {
+    /// Returns (MockQueryReader, end_time) where end_time is suitable for querying
+    fn setup_mock_reader(
+        data: TestSampleData,
+    ) -> (crate::query::test_utils::MockQueryReader, SystemTime) {
         let bucket = TimeBucket::hour(1000);
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
-        let storage_read: Arc<dyn opendata_common::StorageRead> = storage.clone();
-        let tsdb = MiniTsdb::load(bucket.clone(), storage_read).await.unwrap();
+        let mut builder = MockQueryReaderBuilder::new(bucket);
 
         // Base timestamp: 300001ms (ensures samples are > start_ms with 5min lookback)
         // Query time will be calculated to be well after all samples
@@ -836,14 +690,14 @@ mod tests {
             .max()
             .unwrap_or(0);
 
-        let samples: Vec<SampleWithAttributes> = data
-            .into_iter()
-            .map(|(metric_name, labels, offset_ms, value)| {
-                create_sample(metric_name, labels, offset_ms, value, base_timestamp)
-            })
-            .collect();
-
-        tsdb.ingest(samples).await.unwrap();
+        for (metric_name, labels, offset_ms, value) in data {
+            let attributes = create_attributes(metric_name, labels);
+            let sample = Sample {
+                timestamp: base_timestamp + offset_ms,
+                value,
+            };
+            builder.add_sample(attributes, MetricType::Gauge, sample);
+        }
 
         // Query time: base_timestamp + max_offset + 1ms (just after all samples)
         // Lookback window: (start_ms, query_time] where start_ms = query_time - 300000
@@ -857,7 +711,7 @@ mod tests {
         let query_timestamp = base_timestamp + max_offset + 1;
         let end_time = UNIX_EPOCH + Duration::from_millis(query_timestamp);
 
-        (Evaluator::new(tsdb), end_time)
+        (builder.build(), end_time)
     }
 
     #[rstest]
@@ -1325,7 +1179,8 @@ mod tests {
         #[case] test_data: TestSampleData,
         #[case] expected_samples: Vec<(f64, Vec<(&str, &str)>)>,
     ) {
-        let (evaluator, end_time) = setup_tsdb_with_samples(test_data).await;
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader);
         let lookback_delta = Duration::from_secs(300); // 5 minutes
 
         let result = parse_and_evaluate(&evaluator, query, end_time, lookback_delta)
@@ -1337,15 +1192,10 @@ mod tests {
 
     #[tokio::test]
     async fn should_evaluate_number_literal() {
-        // given: create a tsdb
+        // given: create an empty mock reader
         let bucket = TimeBucket::hour(1000);
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
-        let storage_read: Arc<dyn opendata_common::StorageRead> = storage.clone();
-        let tsdb = MiniTsdb::load(bucket.clone(), storage_read).await.unwrap();
-
-        let evaluator = Evaluator::new(tsdb);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let evaluator = Evaluator::new(&reader);
 
         // when: evaluate a number literal (should return scalar, which is unsupported)
         let end_time = UNIX_EPOCH + Duration::from_secs(2000);

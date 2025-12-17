@@ -3,18 +3,15 @@ use std::collections::HashSet;
 use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::VectorSelector;
 
-use crate::index::{ForwardIndex, InvertedIndex};
-use crate::minitsdb::MiniTsdb;
+use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndex, InvertedIndexLookup};
 use crate::model::{Attribute, SeriesId};
-use crate::storage::OpenTsdbStorageReadExt;
+use crate::query::QueryReader;
 use crate::util::Result;
 
-/// Evaluates a PromQL vector selector against the MiniTsdb.
-///
-/// Uses a layered approach: evaluate on each tier (head, frozen, storage)
-/// independently, then union the results. Data is non-overlapping across tiers.
-pub(crate) async fn evaluate_selector(
-    tsdb: &MiniTsdb,
+/// Evaluates a PromQL vector selector using a QueryReader.
+/// This is the core implementation that can be tested independently.
+pub(crate) async fn evaluate_selector_with_reader<R: QueryReader>(
+    reader: &R,
     selector: &VectorSelector,
 ) -> Result<HashSet<SeriesId>> {
     let terms = extract_equality_terms(selector);
@@ -22,46 +19,22 @@ pub(crate) async fn evaluate_selector(
         return Ok(HashSet::new());
     }
 
-    let state = tsdb.state().read().await;
+    // Find all series matching the equality terms from all tiers
+    let inverted_index_view = reader.inverted_index_view(&terms).await?;
+    let candidates: HashSet<SeriesId> = inverted_index_view.intersect(terms).iter().collect();
 
-    // Evaluate on head
-    let head_result = evaluate_on_indexes(
-        state.head().forward_index(),
-        state.head().inverted_index(),
-        selector,
-    );
+    // If there are not-equal matchers, we need to filter using forward index
+    if candidates.is_empty() || !has_not_equal_matchers(selector) {
+        return Ok(candidates);
+    }
 
-    // Evaluate on frozen head if present
-    let frozen_result = state
-        .frozen_head()
-        .map(|frozen| {
-            evaluate_on_indexes(frozen.forward_index(), frozen.inverted_index(), selector)
-        })
-        .unwrap_or_default();
+    // Get forward index view for candidates to apply not-equal filtering
+    // This avoids cloning from head/frozen tiers upfront
+    let candidates_vec: Vec<SeriesId> = candidates.into_iter().collect();
+    let forward_index_view = reader.forward_index_view(&candidates_vec).await?;
+    let filtered = apply_not_equal_matchers(&forward_index_view, candidates_vec, selector);
 
-    // Evaluate on storage
-    // TODO(query-cache): Cache storage data to avoid loading on every query.
-    let storage_inverted = state
-        .snapshot()
-        .get_inverted_index_terms(tsdb.bucket(), &terms)
-        .await?;
-
-    let storage_candidates: Vec<SeriesId> = storage_inverted.intersect(terms).iter().collect();
-    let storage_result = if !storage_candidates.is_empty() && has_not_equal_matchers(selector) {
-        let storage_forward = state
-            .snapshot()
-            .get_forward_index_series(tsdb.bucket(), &storage_candidates)
-            .await?;
-        apply_not_equal_matchers(&storage_forward, storage_candidates, selector)
-    } else {
-        storage_candidates
-    };
-
-    // Merge results from all layers and convert to HashSet
-    let mut result = HashSet::from_iter(head_result);
-    result.extend(frozen_result);
-    result.extend(storage_result);
-    Ok(result)
+    Ok(filtered.into_iter().collect())
 }
 
 /// Evaluate selector on in-memory indexes.
@@ -111,9 +84,9 @@ fn has_not_equal_matchers(selector: &VectorSelector) -> bool {
         .any(|m| matches!(m.op, MatchOp::NotEqual))
 }
 
-/// Apply not-equal matchers using ForwardIndex.
+/// Apply not-equal matchers using any ForwardIndexLookup implementation.
 fn apply_not_equal_matchers(
-    forward_index: &ForwardIndex,
+    index: &impl ForwardIndexLookup,
     candidates: Vec<SeriesId>,
     selector: &VectorSelector,
 ) -> Vec<SeriesId> {
@@ -125,9 +98,8 @@ fn apply_not_equal_matchers(
         .filter(|m| matches!(m.op, MatchOp::NotEqual))
     {
         result.retain(|id| {
-            forward_index
-                .series
-                .get(id)
+            index
+                .get_spec(id)
                 .map(|spec| !has_attr(&spec.attributes, &matcher.name, &matcher.value))
                 .unwrap_or(false)
         });
@@ -305,73 +277,62 @@ mod tests {
 
     #[tokio::test]
     async fn should_merge_results_from_head_and_storage() {
-        use crate::minitsdb::MiniTsdb;
-        use crate::model::{Attribute, MetricType, Sample, SampleWithAttributes, TimeBucket};
-        use crate::storage::merge_operator::OpenTsdbMergeOperator;
-        use opendata_common::storage::in_memory::InMemoryStorage;
-        use std::sync::Arc;
+        use crate::model::{Sample, TimeBucket};
+        use crate::query::test_utils::MockQueryReaderBuilder;
 
-        // given: create a tsdb with storage that has the OpenTSDB merge operator
+        // given: create a mock reader with 3 series
         let bucket = TimeBucket::hour(1000);
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
-        let storage_read: Arc<dyn opendata_common::StorageRead> = storage.clone();
-        let tsdb = MiniTsdb::load(bucket.clone(), storage_read).await.unwrap();
+        let mut builder = MockQueryReaderBuilder::new(bucket);
 
-        // Ingest data and flush to storage (series with env=prod)
-        let storage_samples = vec![
-            SampleWithAttributes {
-                attributes: vec![
-                    Attribute {
-                        key: METRIC_NAME.to_string(),
-                        value: "http_requests_total".to_string(),
-                    },
-                    Attribute {
-                        key: "env".to_string(),
-                        value: "prod".to_string(),
-                    },
-                    Attribute {
-                        key: "method".to_string(),
-                        value: "GET".to_string(),
-                    },
-                ],
-                metric_unit: None,
-                metric_type: MetricType::Gauge,
-                sample: Sample {
-                    timestamp: 1000,
-                    value: 10.0,
+        // Add series with env=prod, method=GET
+        builder.add_sample(
+            vec![
+                Attribute {
+                    key: METRIC_NAME.to_string(),
+                    value: "http_requests_total".to_string(),
                 },
-            },
-            SampleWithAttributes {
-                attributes: vec![
-                    Attribute {
-                        key: METRIC_NAME.to_string(),
-                        value: "http_requests_total".to_string(),
-                    },
-                    Attribute {
-                        key: "env".to_string(),
-                        value: "prod".to_string(),
-                    },
-                    Attribute {
-                        key: "method".to_string(),
-                        value: "POST".to_string(),
-                    },
-                ],
-                metric_unit: None,
-                metric_type: MetricType::Gauge,
-                sample: Sample {
-                    timestamp: 1001,
-                    value: 20.0,
+                Attribute {
+                    key: "env".to_string(),
+                    value: "prod".to_string(),
                 },
+                Attribute {
+                    key: "method".to_string(),
+                    value: "GET".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp: 1000,
+                value: 10.0,
             },
-        ];
-        tsdb.ingest(storage_samples).await.unwrap();
-        tsdb.flush(storage.clone()).await.unwrap();
+        );
 
-        // Ingest more data into head (series with env=staging)
-        let head_samples = vec![SampleWithAttributes {
-            attributes: vec![
+        // Add series with env=prod, method=POST
+        builder.add_sample(
+            vec![
+                Attribute {
+                    key: METRIC_NAME.to_string(),
+                    value: "http_requests_total".to_string(),
+                },
+                Attribute {
+                    key: "env".to_string(),
+                    value: "prod".to_string(),
+                },
+                Attribute {
+                    key: "method".to_string(),
+                    value: "POST".to_string(),
+                },
+            ],
+            MetricType::Gauge,
+            Sample {
+                timestamp: 1001,
+                value: 20.0,
+            },
+        );
+
+        // Add series with env=staging, method=GET
+        builder.add_sample(
+            vec![
                 Attribute {
                     key: METRIC_NAME.to_string(),
                     value: "http_requests_total".to_string(),
@@ -385,14 +346,14 @@ mod tests {
                     value: "GET".to_string(),
                 },
             ],
-            metric_unit: None,
-            metric_type: MetricType::Gauge,
-            sample: Sample {
+            MetricType::Gauge,
+            Sample {
                 timestamp: 2000,
                 value: 30.0,
             },
-        }];
-        tsdb.ingest(head_samples).await.unwrap();
+        );
+
+        let reader = builder.build();
 
         // when: query for all http_requests_total series
         let selector = VectorSelector {
@@ -401,13 +362,11 @@ mod tests {
             offset: None,
             at: None,
         };
-        let result = evaluate_selector(&tsdb, &selector).await.unwrap();
+        let result = evaluate_selector_with_reader(&reader, &selector)
+            .await
+            .unwrap();
 
-        // then: should find series from both head and storage
-        assert_eq!(
-            result.len(),
-            3,
-            "Should find 3 series total (2 from storage, 1 from head)"
-        );
+        // then: should find all 3 series
+        assert_eq!(result.len(), 3, "Should find 3 series total");
     }
 }

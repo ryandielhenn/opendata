@@ -5,6 +5,7 @@ mod index;
 mod minitsdb;
 mod model;
 mod promql;
+mod query;
 mod serde;
 mod storage;
 mod util;

@@ -4,6 +4,34 @@ use std::collections::HashMap;
 
 use crate::model::{Attribute, SeriesId, SeriesSpec};
 
+/// Trait for looking up series specs by ID.
+/// This allows both ForwardIndex and view types to be used interchangeably.
+pub(crate) trait ForwardIndexLookup {
+    /// Get the series spec for a given series ID.
+    /// Returns None if the series is not found.
+    fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec>;
+}
+
+impl<T: ForwardIndexLookup + ?Sized> ForwardIndexLookup for Box<T> {
+    fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
+        (**self).get_spec(series_id)
+    }
+}
+
+/// Trait for querying inverted index data.
+/// This allows both InvertedIndex and view types to be used interchangeably.
+pub(crate) trait InvertedIndexLookup {
+    /// Intersect posting lists for the given terms.
+    /// Returns series IDs that match ALL terms.
+    fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap;
+}
+
+impl<T: InvertedIndexLookup + ?Sized> InvertedIndexLookup for Box<T> {
+    fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap {
+        (**self).intersect(terms)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ForwardIndex {
     pub(crate) series: DashMap<SeriesId, SeriesSpec>,
@@ -19,14 +47,20 @@ impl ForwardIndex {
     }
 }
 
+impl ForwardIndexLookup for ForwardIndex {
+    fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
+        self.series.get(series_id).map(|r| r.value().clone())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InvertedIndex {
     /// Maps Attribute (key, value) to the list of series_id values containing it.
     pub(crate) postings: DashMap<Attribute, RoaringBitmap>,
 }
 
-impl InvertedIndex {
-    pub(crate) fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap {
+impl InvertedIndexLookup for InvertedIndex {
+    fn intersect(&self, terms: Vec<Attribute>) -> RoaringBitmap {
         if terms.is_empty() {
             return RoaringBitmap::new();
         }
@@ -51,7 +85,9 @@ impl InvertedIndex {
 
         result
     }
+}
 
+impl InvertedIndex {
     pub(crate) fn union(&self, terms: Vec<Attribute>) -> RoaringBitmap {
         if terms.is_empty() {
             return RoaringBitmap::new();

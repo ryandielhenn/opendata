@@ -4,7 +4,13 @@ use super::evaluator::{EvalResult, EvalSample};
 
 /// Trait for PromQL functions that operate on instant vectors
 pub(crate) trait PromQLFunction {
-    fn apply(&self, samples: Vec<EvalSample>) -> EvalResult<Vec<EvalSample>>;
+    /// Apply the function to the input samples.
+    /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
+    fn apply(
+        &self,
+        samples: Vec<EvalSample>,
+        eval_timestamp_ms: u64,
+    ) -> EvalResult<Vec<EvalSample>>;
 }
 
 /// Function that applies a unary operation to each sample
@@ -13,7 +19,11 @@ struct UnaryFunction {
 }
 
 impl PromQLFunction for UnaryFunction {
-    fn apply(&self, mut samples: Vec<EvalSample>) -> EvalResult<Vec<EvalSample>> {
+    fn apply(
+        &self,
+        mut samples: Vec<EvalSample>,
+        _eval_timestamp_ms: u64,
+    ) -> EvalResult<Vec<EvalSample>> {
         for sample in &mut samples {
             sample.value = (self.op)(sample.value);
         }
@@ -126,16 +136,15 @@ impl FunctionRegistry {
 struct AbsentFunction;
 
 impl PromQLFunction for AbsentFunction {
-    fn apply(&self, samples: Vec<EvalSample>) -> EvalResult<Vec<EvalSample>> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
+    fn apply(
+        &self,
+        samples: Vec<EvalSample>,
+        eval_timestamp_ms: u64,
+    ) -> EvalResult<Vec<EvalSample>> {
         if samples.is_empty() {
-            // Return a single sample with value 1.0 when the input vector is empty
+            // Return a single sample with value 1.0 at the evaluation timestamp
             Ok(vec![EvalSample {
-                timestamp_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
+                timestamp_ms: eval_timestamp_ms,
                 value: 1.0,
                 labels: HashMap::new(),
             }])
@@ -150,7 +159,11 @@ impl PromQLFunction for AbsentFunction {
 struct ScalarFunction;
 
 impl PromQLFunction for ScalarFunction {
-    fn apply(&self, samples: Vec<EvalSample>) -> EvalResult<Vec<EvalSample>> {
+    fn apply(
+        &self,
+        samples: Vec<EvalSample>,
+        _eval_timestamp_ms: u64,
+    ) -> EvalResult<Vec<EvalSample>> {
         if samples.len() == 1 {
             // Return the single sample (scalar converts single-element vector to scalar)
             Ok(samples)
@@ -180,7 +193,7 @@ mod tests {
         let func = registry.get("abs").unwrap();
 
         let samples = vec![create_sample(-5.0), create_sample(3.0)];
-        let result = func.apply(samples).unwrap();
+        let result = func.apply(samples, 1000).unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].value, 5.0);
@@ -192,13 +205,18 @@ mod tests {
         let registry = FunctionRegistry::new();
         let func = registry.get("absent").unwrap();
 
-        // Empty input should return one sample with value 1.0
-        let result = func.apply(vec![]).unwrap();
+        let eval_timestamp_ms = 5000u64;
+
+        // Empty input should return one sample with value 1.0 at eval timestamp
+        let result = func.apply(vec![], eval_timestamp_ms).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 1.0);
+        assert_eq!(result[0].timestamp_ms, eval_timestamp_ms);
 
         // Non-empty input should return empty
-        let result = func.apply(vec![create_sample(42.0)]).unwrap();
+        let result = func
+            .apply(vec![create_sample(42.0)], eval_timestamp_ms)
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -208,16 +226,16 @@ mod tests {
         let func = registry.get("scalar").unwrap();
 
         // Single element should be returned
-        let result = func.apply(vec![create_sample(42.0)]).unwrap();
+        let result = func.apply(vec![create_sample(42.0)], 1000).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 42.0);
 
         // Zero or multiple elements should return empty
-        let result = func.apply(vec![]).unwrap();
+        let result = func.apply(vec![], 1000).unwrap();
         assert!(result.is_empty());
 
         let result = func
-            .apply(vec![create_sample(1.0), create_sample(2.0)])
+            .apply(vec![create_sample(1.0), create_sample(2.0)], 1000)
             .unwrap();
         assert!(result.is_empty());
     }
