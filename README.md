@@ -1,5 +1,10 @@
 # Overview
 
+<img src="https://github.com/opendata-oss/opendata/blob/main/public/github-banner.png?raw=true" alt="OpenData" width="100%">
+
+[![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/VsUK5FDj)
+[![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
+
 OpenData is a collection of open source databases designed from ground up for object storage. We aim to deliver highly focused, objectstore-native versions of online databases that can power your application stack. As of today, we have a competitive timeseries database and a data streaming backend. We plan to ship vector search, text search, and other database types over time. Contributions are welcome!
 
 Building performant, cost-effective, and correct online systems on object storage takes special care. Successful designs all have to solve the problem of write batching, multiple levels of caching, and snapshot isolation for correctness. OpenData systems build on a common foundation to solve these problems. This common foundation gives OpenData systems a common set of operational tools, configuration systems, etc., that make our systems easier to operate in aggregate. 
