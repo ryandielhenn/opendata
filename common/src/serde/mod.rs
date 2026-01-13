@@ -2,6 +2,7 @@
 
 pub mod seq_block;
 pub mod terminated_bytes;
+pub mod varint;
 
 /// Error type for deserialization failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
