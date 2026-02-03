@@ -42,6 +42,11 @@ pub async fn handle_append(
     let request = AppendRequest::from_body(&headers, &body)?;
 
     let count = request.records.len();
+    let bytes_count: usize = request
+        .records
+        .iter()
+        .map(|rec| rec.key.len() + rec.value.len())
+        .sum();
     let options = WriteOptions {
         await_durable: request.await_durable,
     };
@@ -52,6 +57,10 @@ pub async fn handle_append(
         .await?;
 
     state.metrics.log_append_records_total.inc_by(count as u64);
+    state
+        .metrics
+        .log_append_bytes_total
+        .inc_by(bytes_count as u64);
 
     let response = AppendResponse::success(result.records_appended as i32, result.start_sequence);
     Ok(to_api_response(response, format))
@@ -86,6 +95,18 @@ pub async fn handle_scan(
             value: e.value.clone(),
         })
         .collect();
+    let bytes_scanned: usize = entries
+        .iter()
+        .map(|entry| entry.key.len() + entry.value.len())
+        .sum();
+    state
+        .metrics
+        .log_records_scanned_total
+        .inc_by(values.len() as u64);
+    state
+        .metrics
+        .log_bytes_scanned_total
+        .inc_by(bytes_scanned as u64);
     let response = ScanResponse::success(key, values);
     Ok(to_api_response(response, format))
 }
