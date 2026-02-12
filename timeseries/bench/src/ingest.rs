@@ -12,11 +12,7 @@ use timeseries::{Label, Sample, Series};
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
 /// Create a parameter set for the ingest benchmark.
-fn make_params(
-    num_series: usize,
-    num_labels: usize,
-    num_samples: usize,
-) -> Params {
+fn make_params(num_series: usize, num_labels: usize, num_samples: usize) -> Params {
     let mut params = Params::new();
     params.insert("num_series", num_series.to_string());
     params.insert("num_labels", num_labels.to_string());
@@ -75,7 +71,7 @@ impl Benchmark for IngestBenchmark {
         // Live metrics - updated during the benchmark
         let sample_counter = bench.counter("sample_count");
         let series_counter = bench.counter("series_count");
-        let batch_latency= bench.histogram("batch_latency_us");
+        let batch_latency = bench.histogram("batch_latency_us");
 
         // Generate timeseries data
         let series: Vec<Series> = (0..num_series)
