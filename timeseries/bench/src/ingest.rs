@@ -85,15 +85,14 @@ impl Benchmark for IngestBenchmark {
             let series: Vec<Series> = (0..num_series)
                 .map(|i| {
                     let labels: Vec<Label> = (0..num_labels)
-                        .map(|j| Label::new(format!("label_{}", i), format!("value_{}", j)))
+                        .map(|j| Label::new(format!("label_{}", j), format!("value_{}", i)))
                         .collect();
 
-                    let base_timestamp =
-                        (iteration * num_series as u64 * num_samples as u64 * 1500)
-                            + (i as u64 * num_samples as u64 * 1500);
+                    let base_timestamp = iteration as u64 * 3_600_000;
+
                     let samples: Vec<Sample> = (0..num_samples)
                         .map(|j| Sample {
-                            timestamp_ms: base_timestamp as i64 + (j as i64 * 1500),
+                            timestamp_ms: base_timestamp as i64 + (j as i64 * 100),
                             value: 1.0,
                         })
                         .collect();
@@ -104,13 +103,13 @@ impl Benchmark for IngestBenchmark {
 
             let batch_start = std::time::Instant::now();
             //ingest
-            tsdb.ingest_samples(series.clone(), 5).await?;
-            let series_elapsed = batch_start.elapsed();
+            tsdb.ingest_samples(series, 5).await?;
+            let ingest_elapsed = batch_start.elapsed();
 
             // Update live metrics
             sample_counter.increment((num_samples * num_series) as u64);
             series_counter.increment(num_series as u64);
-            batch_latency.record(series_elapsed.as_secs_f64() * MICROS_PER_SEC);
+            batch_latency.record(ingest_elapsed.as_secs_f64() * MICROS_PER_SEC);
 
             series_written += num_series;
             iteration += 1;
