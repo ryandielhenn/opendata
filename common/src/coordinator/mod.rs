@@ -26,6 +26,7 @@ enum FlushEvent<D: Delta> {
 // Internal use only
 use crate::StorageRead;
 use crate::storage::StorageSnapshot;
+use async_trait::async_trait;
 pub(crate) use handle::EpochWatcher;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -71,6 +72,7 @@ pub(crate) enum WriteCommand<D: Delta> {
 /// and coordinates flushing through a `Flusher`.
 pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
     handles: HashMap<String, WriteCoordinatorHandle<D>>,
+    pause_handles: HashMap<String, PauseHandle>,
     stop_tok: CancellationToken,
     tasks: Option<(WriteCoordinatorTask<D>, FlushTask<D, F>)>,
     write_task_jh: Option<tokio::task::JoinHandle<Result<(), String>>>,
@@ -80,7 +82,7 @@ pub struct WriteCoordinator<D: Delta, F: Flusher<D>> {
 impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
     pub fn new(
         config: WriteCoordinatorConfig,
-        channels: Vec<String>,
+        channels: Vec<impl ToString>,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
         flusher: F,
@@ -91,10 +93,12 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         // Create a write channel per named input
         let mut write_rxs = Vec::with_capacity(channels.len());
         let mut write_txs = HashMap::new();
+        let mut pause_handles = HashMap::new();
         for name in &channels {
-            let (write_tx, write_rx) = mpsc::channel(config.queue_capacity);
+            let (write_tx, write_rx, pause_hdl) = pausable_channel(config.queue_capacity);
             write_rxs.push(write_rx);
-            write_txs.insert(name.clone(), write_tx);
+            write_txs.insert(name.to_string(), write_tx);
+            pause_handles.insert(name.to_string(), pause_hdl);
         }
 
         // this is the channel that sends FlushEvents to be flushed
@@ -121,9 +125,9 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         let mut handles = HashMap::new();
         for name in channels {
-            let write_tx = write_txs.remove(&name).expect("unreachable");
+            let write_tx = write_txs.remove(&name.to_string()).expect("unreachable");
             handles.insert(
-                name,
+                name.to_string(),
                 WriteCoordinatorHandle::new(write_tx, watcher.clone(), view.clone()),
             );
         }
@@ -139,6 +143,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         Self {
             handles,
+            pause_handles,
             tasks: Some((write_task, flush_task)),
             write_task_jh: None,
             stop_tok,
@@ -148,6 +153,13 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
     pub fn handle(&self, name: &str) -> WriteCoordinatorHandle<D> {
         self.handles
+            .get(name)
+            .expect("unknown channel name")
+            .clone()
+    }
+
+    pub fn pause_handle(&self, name: &str) -> PauseHandle {
+        self.pause_handles
             .get(name)
             .expect("unknown channel name")
             .clone()
@@ -185,7 +197,7 @@ struct WriteCoordinatorTask<D: Delta> {
     config: WriteCoordinatorConfig,
     delta: CurrentDelta<D>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
-    write_rxs: Vec<mpsc::Receiver<WriteCommand<D>>>,
+    write_rxs: Vec<PausableReceiver<D>>,
     watermarks: Arc<EpochWatermarks>,
     view: Arc<BroadcastedView<D>>,
     epoch: u64,
@@ -204,7 +216,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
         initial_snapshot: Arc<dyn StorageSnapshot>,
-        write_rxs: Vec<mpsc::Receiver<WriteCommand<D>>>,
+        write_rxs: Vec<PausableReceiver<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         watermarks: Arc<EpochWatermarks>,
         stop_tok: CancellationToken,
@@ -603,6 +615,55 @@ impl<D: Delta> BroadcastedViewInner<D> {
     }
 }
 
+struct PausableReceiver<D: Delta> {
+    pause_rx: Option<watch::Receiver<bool>>,
+    rx: mpsc::Receiver<WriteCommand<D>>,
+}
+
+impl<D: Delta> PausableReceiver<D> {
+    async fn recv(&mut self) -> Option<WriteCommand<D>> {
+        if let Some(pause_rx) = self.pause_rx.as_mut() {
+            pause_rx.wait_for(|v| !*v).await;
+        }
+        self.rx.recv().await
+    }
+}
+
+/// A handle that can be used to pause/unpause the coordinator's consumption from a write queue
+#[derive(Clone)]
+pub struct PauseHandle {
+    pause_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl PauseHandle {
+    fn pause(&self) {
+        self.pause_tx.send_replace(true);
+    }
+
+    fn unpause(&self) {
+        self.pause_tx.send_replace(false);
+    }
+}
+
+fn pausable_channel<D: Delta>(
+    capacity: usize,
+) -> (
+    mpsc::Sender<WriteCommand<D>>,
+    PausableReceiver<D>,
+    PauseHandle,
+) {
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let (tx, rx) = mpsc::channel(capacity);
+    (
+        tx,
+        PausableReceiver {
+            pause_rx: Some(pause_rx),
+            rx,
+        },
+        PauseHandle { pause_tx },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,7 +674,7 @@ mod tests {
     use crate::{Storage, StorageRead};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::sync::Mutex;
     // ============================================================================
@@ -2674,5 +2735,61 @@ mod tests {
 
         // then
         assert!(matches!(result, Err(WriteError::Shutdown)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_pause_and_resume_write_channel() {
+        // given
+        let flusher = TestFlusher::default();
+        let mut config = test_config();
+        config.flush_size_threshold = usize::MAX;
+        config.flush_interval = Duration::from_hours(24);
+        let mut coordinator = WriteCoordinator::new(
+            config,
+            vec!["a", "b"],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle_a = coordinator.handle("a");
+        let handle_b = coordinator.handle("b");
+        let pause_handle = coordinator.pause_handle("a");
+        coordinator.start();
+
+        // when
+        pause_handle.pause();
+        let mut result_a = handle_a
+            .try_write(TestWrite {
+                key: "a".into(),
+                value: 1,
+                size: 1,
+            })
+            .await
+            .unwrap();
+        for i in 0..1000 {
+            handle_b
+                .try_write(TestWrite {
+                    key: format!("b{}", i),
+                    value: i,
+                    size: 1,
+                })
+                .await
+                .unwrap()
+                .wait(Durability::Applied)
+                .await
+                .unwrap();
+        }
+
+        // then
+        // make sure the data only contains keys from b (so a was never processed)
+        let data = coordinator.view().current.data.lock().unwrap().clone();
+        let mut expected = (0..1000).map(|i| format!("b{}", i)).collect::<HashSet<_>>();
+        assert_eq!(data.keys().cloned().collect::<HashSet<_>>(), expected);
+        pause_handle.unpause();
+        // after resuming, wait for the data to include keys from a
+        result_a.wait(Durability::Applied).await.unwrap();
+        let data = coordinator.view().current.data.lock().unwrap().clone();
+        expected.insert("a".into());
+        assert_eq!(data.keys().cloned().collect::<HashSet<_>>(), expected);
     }
 }
